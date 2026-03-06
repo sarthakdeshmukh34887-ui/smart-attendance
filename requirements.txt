@@ -1,0 +1,9 @@
+tensorflow-cpu==2.15.0
+opencv-python-headless
+mediapipe==0.10.11
+numpy==1.26.4
+streamlit
+pandas
+scikit-learn
+streamlit-webrtc
+av

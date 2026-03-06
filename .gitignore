@@ -1,0 +1,7 @@
+# Virtual environment
+myenv/
+venv/
+__pycache__/
+*.exe
+*.pkl
+models/attendance_model.h5
