@@ -31,18 +31,13 @@ if st.button("Start Camera"):
             if not ret: break
             frame = cv2.flip(frame, 1)
             
-            # Find face
             faces = extract_face_crops(frame)
             
             if faces:
-                # Take the first face found for registration
                 (x, y, w, h), face_crop = faces[0]
-                
-                # Get ID
                 emb = get_embedding(face_crop, embedder)
                 if emb is not None:
                     embeddings.append(emb)
-                    # Dynamic Green Box
                     cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
             else:
                 cv2.putText(frame, "No Face", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
@@ -56,7 +51,14 @@ if st.button("Start Camera"):
         filename = f"data/{roll}_{name}.pkl"
         with open(filename, 'wb') as f:
             pickle.dump(embeddings, f)
-            
-        st.success("✅ Saved! Retraining model...")
-        retrain_system()
-        st.success("🚀 Done!")
+
+        st.success(f"✅ Face samples saved for {name} (Roll: {roll})")
+        
+        with st.spinner("🔄 Retraining model with new student... please wait"):
+            success = retrain_system()
+        
+        if success:
+            st.success("🚀 Model retrained successfully! Attendance system is ready.")
+            st.balloons()
+        else:
+            st.error("❌ Retraining failed — need at least 2 registered students.")
