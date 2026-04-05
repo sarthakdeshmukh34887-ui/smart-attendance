@@ -8,14 +8,14 @@ from datetime import datetime
 from scipy.spatial.distance import cosine
 from face_utils import create_embedder, extract_face_crops, get_embedding
 
-# Config
+# ── Config ────────────────────────────────────────────────────────────────────
 MODEL_PATH = os.path.join('models', 'attendance_model.h5')
 LABEL_PATH = os.path.join('models', 'label_map.pkl')
 DATA_DIR   = 'data'
 CSV_FILE   = "attendance.csv"
 
 if not os.path.exists(MODEL_PATH):
-    print("❌ Model not found! Run 'register.py' first.")
+    print("❌ Model not found! Run register first.")
     exit()
 
 # ── Load AI ───────────────────────────────────────────────────────────────────
@@ -24,45 +24,45 @@ model = tf.keras.models.load_model(MODEL_PATH)
 with open(LABEL_PATH, 'rb') as f:
     label_map = pickle.load(f)
 
-# Load stored embeddings for cosine similarity check
 print("⏳ Loading stored embeddings...")
-embedding_store = {}  # {class_id: [emb, emb, ...]}
+embedding_store = {}
 for idx, name in label_map.items():
     pkl_path = os.path.join(DATA_DIR, f'{name}.pkl')
     if os.path.exists(pkl_path):
         with open(pkl_path, 'rb') as f:
             embedding_store[idx] = pickle.load(f)
 
-embedder = create_embedder()
+embedder          = create_embedder()
 session_attendance = set()
 
-# ── Thresholds — raise CONFIDENCE or lower COSINE if unknowns still slip through
-CONFIDENCE_THRESHOLD = 0.60   # was 0.80
-ENTROPY_THRESHOLD    = 0.90   # was 0.65
-COSINE_SIM_THRESHOLD = 0.40   # was 0.60
+# ── Thresholds ────────────────────────────────────────────────────────────────
+CONFIDENCE_THRESHOLD = 0.45
+ENTROPY_THRESHOLD    = 1.50
+COSINE_SIM_THRESHOLD = 0.20
 
-# ── Helper functions ──────────────────────────────────────────────────────────
-def softmax_entropy(probs: np.ndarray) -> float:
-    """High entropy = model is unsure = likely unknown face."""
+# ── Face enhancement ──────────────────────────────────────────────────────────
+def enhance_face(img):
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    l = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+
+# ── Gate helpers ──────────────────────────────────────────────────────────────
+def softmax_entropy(probs):
     probs = np.clip(probs, 1e-9, 1.0)
     return float(-np.sum(probs * np.log(probs)))
 
-def best_cosine_sim(embedding: np.ndarray, class_id: int) -> float:
-    """Compare face embedding directly against every stored sample for that class."""
+def best_cosine_sim(embedding, class_id):
     stored = embedding_store.get(class_id, [])
     if not stored:
         return 0.0
     return max(1 - cosine(embedding, s) for s in stored)
 
-def is_known_face(emb: np.ndarray, probs: np.ndarray, class_id: int) -> tuple:
-    """
-    Returns (is_known: bool, confidence: float, entropy: float, cos_sim: float)
-    ALL three gates must pass, otherwise → Unknown.
-    """
+def is_known_face(emb, probs, class_id):
     confidence = float(np.max(probs))
     entropy    = softmax_entropy(probs)
     cos_sim    = best_cosine_sim(emb, class_id)
-
     known = (
         confidence >= CONFIDENCE_THRESHOLD and
         entropy    <= ENTROPY_THRESHOLD    and
@@ -70,7 +70,7 @@ def is_known_face(emb: np.ndarray, probs: np.ndarray, class_id: int) -> tuple:
     )
     return known, confidence, entropy, cos_sim
 
-# ── Attendance marking (unchanged) ───────────────────────────────────────────
+# ── Attendance marking ────────────────────────────────────────────────────────
 def mark_attendance(student_label):
     try:
         roll, name = student_label.split('_', 1)
@@ -97,6 +97,7 @@ def mark_attendance(student_label):
 
 # ── Camera loop ───────────────────────────────────────────────────────────────
 cap = cv2.VideoCapture(0)
+print("🎥 Camera started. Press Q to quit.")
 
 while True:
     ret, frame = cap.read()
@@ -106,20 +107,25 @@ while True:
     faces_found = extract_face_crops(frame)
 
     for (x, y, w, h), face_crop in faces_found:
-        emb = get_embedding(face_crop, embedder)
+        face_crop = enhance_face(face_crop)
+        emb       = get_embedding(face_crop, embedder)
 
         if emb is not None:
-            # L2-normalize — must match how training embeddings were normalized
-            emb = emb / max(np.linalg.norm(emb), 1e-8)
+            norm     = np.linalg.norm(emb)
+            emb_norm = emb / max(norm, 1e-8)
 
-            probs    = model.predict(np.expand_dims(emb, axis=0), verbose=0)[0]
+            probs    = model.predict(
+                np.expand_dims(emb_norm, axis=0), verbose=0
+            )[0]
             class_id = int(np.argmax(probs))
 
-            known, conf, entropy, cos_sim = is_known_face(emb, probs, class_id)
+            known, conf, entropy, cos_sim = is_known_face(
+                emb_norm, probs, class_id
+            )
 
             if known:
                 student_label = label_map[class_id]
-                color = (0, 255, 0)  # green
+                color = (0, 255, 0)
                 try:
                     display_name = student_label.split('_', 1)[1]
                 except:
@@ -127,10 +133,10 @@ while True:
                 text = f"{display_name} {int(conf*100)}%"
                 mark_attendance(student_label)
             else:
-                color = (0, 0, 255)  # red
+                color = (0, 0, 255)
                 text  = "Unknown"
-                # Uncomment to debug why a face is being rejected:
-                print(f"[REJECTED] conf={conf:.2f} entropy={entropy:.3f} cos={cos_sim:.3f}")
+                # Uncomment to debug:
+                # print(f"[REJECTED] conf={conf:.2f} entropy={entropy:.3f} cos={cos_sim:.3f}")
 
             cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
             cv2.putText(frame, text, (x, y-10),

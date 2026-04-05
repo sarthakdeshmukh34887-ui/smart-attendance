@@ -16,46 +16,40 @@ from scipy.spatial.distance import cosine
 from face_utils import create_embedder, extract_face_crops, get_embedding
 from train_model import retrain_system
 
-# --- HIDE TENSORFLOW LOGS ---
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
-# --- PAGE CONFIG ---
 st.set_page_config(page_title="Biometric Attendance Dashboard", page_icon="🛡️", layout="wide")
 
-# --- SUCCESS BEEP ---
 def play_beep():
-    beep_html = """
+    st.components.v1.html("""
         <audio autoplay>
             <source src="https://cdn.pixabay.com/audio/2022/03/15/audio_507204595e.mp3" type="audio/mpeg">
         </audio>
-    """
-    st.components.v1.html(beep_html, height=0)
+    """, height=0)
 
 # --- CONSTANTS ---
-MODEL_PATH      = 'models/attendance_model.h5'
-LABEL_PATH      = 'models/label_map.pkl'
-FINGER_MAP_PATH = 'models/finger_map.pkl'
-DATA_DIR        = 'data'
-CSV_FILE        = "attendance.csv"
-lock            = threading.Lock()
+MODEL_PATH    = 'models/attendance_model.h5'
+LABEL_PATH    = 'models/label_map.pkl'
+RFID_MAP_PATH = 'models/rfid_map.pkl'
+DATA_DIR      = 'data'
+CSV_FILE      = "attendance.csv"
+lock          = threading.Lock()
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
 CONFIDENCE_THRESHOLD = 0.45
 ENTROPY_THRESHOLD    = 1.50
 COSINE_SIM_THRESHOLD = 0.20
 
-# ── Face enhancement — fixes backlit / dark faces ─────────────────────────────
+# ── Face enhancement ──────────────────────────────────────────────────────────
 def enhance_face(img):
-    """CLAHE on L channel — auto-corrects dark/backlit face crops."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
     l = clahe.apply(l)
-    lab = cv2.merge((l, a, b))
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
 
-# ── Gate helper functions ─────────────────────────────────────────────────────
+# ── Gate helpers ──────────────────────────────────────────────────────────────
 def softmax_entropy(probs):
     probs = np.clip(probs, 1e-9, 1.0)
     return float(-np.sum(probs * np.log(probs)))
@@ -83,13 +77,16 @@ def is_known_face(emb, probs, class_id, embedding_store):
 @st.cache_resource
 def load_resources():
     embedder = create_embedder()
-    model, label_map, finger_map, embedding_store = None, {}, {}, {}
+    model, label_map, rfid_map, embedding_store = None, {}, {}, {}
 
     if os.path.exists(MODEL_PATH):
         model = tf.keras.models.load_model(MODEL_PATH)
     if os.path.exists(LABEL_PATH):
         with open(LABEL_PATH, 'rb') as f:
             label_map = pickle.load(f)
+    if os.path.exists(RFID_MAP_PATH):
+        with open(RFID_MAP_PATH, 'rb') as f:
+            rfid_map = pickle.load(f)
 
     for idx, name in label_map.items():
         pkl_path = os.path.join(DATA_DIR, f'{name}.pkl')
@@ -97,13 +94,9 @@ def load_resources():
             with open(pkl_path, 'rb') as f:
                 embedding_store[idx] = pickle.load(f)
 
-    if os.path.exists(FINGER_MAP_PATH):
-        with open(FINGER_MAP_PATH, 'rb') as f:
-            finger_map = pickle.load(f)
+    return embedder, model, label_map, rfid_map, embedding_store
 
-    return embedder, model, label_map, finger_map, embedding_store
-
-embedder, model, label_map, finger_map, embedding_store = load_resources()
+embedder, model, label_map, rfid_map, embedding_store = load_resources()
 
 # ==========================================
 # 2. ATTENDANCE LOGIC
@@ -128,7 +121,7 @@ def mark_attendance(roll_name, method):
         df.to_csv(CSV_FILE, mode='a', header=not file_exists, index=False)
 
 # ==========================================
-# 3. VIDEO PROCESSOR CLASS
+# 3. VIDEO PROCESSOR
 # ==========================================
 class DualProcessor(VideoProcessorBase):
     def __init__(self, mode="mark"):
@@ -142,7 +135,6 @@ class DualProcessor(VideoProcessorBase):
         faces = extract_face_crops(img)
 
         for (x, y, w, h), crop in faces:
-            # enhance BEFORE embedding — fixes dark/backlit faces
             crop = enhance_face(crop)
             emb  = get_embedding(crop, embedder)
             if emb is None:
@@ -160,16 +152,13 @@ class DualProcessor(VideoProcessorBase):
                 else:
                     norm     = np.linalg.norm(emb)
                     emb_norm = emb / max(norm, 1e-8)
-
                     probs    = model.predict(
                         np.expand_dims(emb_norm, axis=0), verbose=0
                     )[0]
                     class_id = int(np.argmax(probs))
-
                     known, conf, entropy, cos_sim = is_known_face(
                         emb_norm, probs, class_id, embedding_store
                     )
-
                     if known:
                         lbl = label_map.get(class_id, "Unknown")
                         if lbl not in self.marked:
@@ -216,89 +205,131 @@ if st.sidebar.button("🔄 Refresh Hardware"):
     st.cache_resource.clear()
     st.rerun()
 
-if ser: st.success(f"✅ Arduino R307 detected on **{selected_port}**")
+if ser: st.success(f"✅ RC522 RFID detected on **{selected_port}**")
 else:   st.error("❌ Arduino not detected. Check COM Port.")
 
 # ==========================================
-# 5. NAVIGATION & UI
+# 5. NAVIGATION
 # ==========================================
 menu = st.sidebar.selectbox(
-    "Navigation", ["Mark Attendance", "Register New User", "View Records"]
+    "Navigation", ["Mark Attendance", "Register New User", "Manage RFID Cards", "View Records"]
 )
 
-# ── Register ──────────────────────────────────────────────────────────────────
+# ── Register Face ─────────────────────────────────────────────────────────────
 if menu == "Register New User":
-    st.header("👤 Biometric Enrollment Center")
-    tab_face, tab_finger = st.tabs(["📸 Face Registration", "☝️ Fingerprint Registration"])
+    st.header("👤 Face Registration")
+    st.info("💡 Register in the same lighting as attendance. Move head slightly for better accuracy.")
+    c1, c2 = st.columns(2)
+    f_name = c1.text_input("Name", key="fn")
+    f_roll = c2.text_input("Roll No", key="fr")
 
-    with tab_face:
-        st.subheader("Face Enrollment")
-        st.info("💡 Tip: Register in the same lighting where attendance will be taken. Move your head slightly during registration for better accuracy.")
-        c1, c2   = st.columns(2)
-        f_name   = c1.text_input("Name", key="fn")
-        f_roll   = c2.text_input("Roll", key="fr")
-        face_ctx = webrtc_streamer(
-            key="face_reg",
-            video_processor_factory=lambda: DualProcessor(mode="register"),
-            media_stream_constraints={"video": True, "audio": False}
-        )
-        if st.button("💾 Save Face Samples"):
-            if face_ctx.video_processor and len(face_ctx.video_processor.face_samples) >= 50:
+    face_ctx = webrtc_streamer(
+        key="face_reg",
+        video_processor_factory=lambda: DualProcessor(mode="register"),
+        media_stream_constraints={"video": True, "audio": False}
+    )
+
+    if st.button("💾 Save Face Samples"):
+        if face_ctx.video_processor and len(face_ctx.video_processor.face_samples) >= 50:
+            if not f_name or not f_roll:
+                st.error("Enter Name and Roll No first!")
+            else:
                 label = f"{f_roll}_{f_name}"
                 with open(f"data/{label}.pkl", 'wb') as f:
                     pickle.dump(face_ctx.video_processor.face_samples, f)
-                with st.spinner("🔄 Retraining model... please wait"):
+                with st.spinner("🔄 Retraining model..."):
                     success = retrain_system()
                 if success:
                     st.cache_resource.clear()
-                    st.success(f"✅ {f_name} registered and model updated!")
+                    st.success(f"✅ {f_name} registered!")
                     play_beep()
                     st.balloons()
                 else:
-                    st.error("❌ Retraining failed — need at least 2 registered students.")
-            else:
-                samples = len(face_ctx.video_processor.face_samples) if face_ctx.video_processor else 0
-                st.warning(f"⚠️ Not enough samples yet ({samples}/50). Keep your face in frame.")
-
-    with tab_finger:
-        st.subheader("Fingerprint Enrollment")
-        if not ser:
-            st.warning("Please connect Arduino first.")
+                    st.error("❌ Need at least 2 registered students to train.")
         else:
-            c1, c2, c3 = st.columns(3)
-            g_name  = c1.text_input("Name", key="gn")
-            g_roll  = c2.text_input("Roll", key="gr")
-            g_id    = c3.number_input("Slot", 1, 127, key="gi")
-            finger_status = st.empty()
-            if st.button("🔴 Start Fingerprint Scan"):
-                ser.write(f"ENROLL:{g_id}\n".encode())
-                timeout = time.time() + 30
+            samples = len(face_ctx.video_processor.face_samples) if face_ctx.video_processor else 0
+            st.warning(f"⚠️ Only {samples}/50 samples captured. Keep face in frame.")
+
+# ── Manage RFID Cards ─────────────────────────────────────────────────────────
+elif menu == "Manage RFID Cards":
+    st.header("📡 RFID Card Management")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Register New Card")
+        if not ser:
+            st.warning("Connect Arduino first.")
+        else:
+            # Show registered students as dropdown
+            if label_map:
+                student_options = list(label_map.values())
+                selected_student = st.selectbox("Select Student", student_options)
+            else:
+                st.warning("No students registered yet. Register faces first.")
+                selected_student = None
+
+            rfid_status = st.empty()
+
+            if st.button("🔴 Scan Card to Register") and selected_student:
+                rfid_status.info("📡 Waiting for RFID card... tap your card now")
+                timeout = time.time() + 15
+                registered = False
                 while time.time() < timeout:
                     if ser.in_waiting:
-                        msg = ser.readline().decode(errors='ignore').strip()
-                        if "PLACE_FINGER"   in msg: finger_status.warning("☝️ PLACE FINGER")
-                        if "REMOVE_FINGER"  in msg: finger_status.warning("👋 REMOVE FINGER")
-                        if "ENROLL_SUCCESS" in msg:
-                            finger_map[str(g_id)] = f"{g_roll}_{g_name}"
-                            with open(FINGER_MAP_PATH, 'wb') as f:
-                                pickle.dump(finger_map, f)
-                            finger_status.success(f"✅ Slot {g_id} Enrolled!")
+                        line = ser.readline().decode(errors='ignore').strip()
+                        if line.startswith("UID:"):
+                            uid = line.split("UID:")[1].strip().upper()
+                            rfid_map[uid] = selected_student
+                            with open(RFID_MAP_PATH, 'wb') as f:
+                                pickle.dump(rfid_map, f)
+                            rfid_status.success(f"✅ Card {uid} linked to {selected_student}!")
                             play_beep()
+                            registered = True
                             break
-                    time.sleep(0.1)
+                    time.sleep(0.05)
+                if not registered:
+                    rfid_status.error("⏰ Timeout — no card detected. Try again.")
+
+    with col2:
+        st.subheader("Registered Cards")
+        if rfid_map:
+            rfid_df = pd.DataFrame([
+                {"UID": uid, "Student": name}
+                for uid, name in rfid_map.items()
+            ])
+            st.dataframe(rfid_df, use_container_width=True)
+
+            # Delete a card
+            uid_to_delete = st.selectbox("Select card to remove", list(rfid_map.keys()))
+            if st.button("🗑️ Remove Card"):
+                del rfid_map[uid_to_delete]
+                with open(RFID_MAP_PATH, 'wb') as f:
+                    pickle.dump(rfid_map, f)
+                st.success(f"Card {uid_to_delete} removed.")
+                st.rerun()
+        else:
+            st.info("No RFID cards registered yet.")
 
 # ── Mark Attendance ───────────────────────────────────────────────────────────
 elif menu == "Mark Attendance":
     st.header("📷 Live Attendance Terminal")
 
+    # RFID listener
     if ser and ser.in_waiting:
-        line = ser.readline().decode(errors='ignore').strip()
-        if "FOUND_ID:" in line:
-            fid = line.split(":")[-1]
-            if fid in finger_map:
-                mark_attendance(finger_map[fid], "Fingerprint")
-                st.toast(f"☝️ Fingerprint Match: {finger_map[fid]}", icon="✅")
-                play_beep()
+        try:
+            line = ser.readline().decode(errors='ignore').strip()
+            if line.startswith("UID:"):
+                uid = line.split("UID:")[1].strip().upper()
+                if uid in rfid_map:
+                    student = rfid_map[uid]
+                    mark_attendance(student, "RFID")
+                    st.toast(f"📡 RFID: {student.split('_')[-1]} marked present!", icon="✅")
+                    play_beep()
+                else:
+                    st.toast(f"⚠️ Unknown card: {uid}", icon="❌")
+        except:
+            pass
 
     webrtc_streamer(
         key="att",
@@ -312,8 +343,18 @@ elif menu == "View Records":
     if os.path.exists(CSV_FILE):
         df = pd.read_csv(CSV_FILE, on_bad_lines='skip')
         st.dataframe(df.iloc[::-1], use_container_width=True)
-        if st.button("🗑️ Clear Records"):
-            os.remove(CSV_FILE)
-            st.rerun()
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🗑️ Clear All Records"):
+                os.remove(CSV_FILE)
+                st.rerun()
+        with col2:
+            st.download_button(
+                "⬇️ Download CSV",
+                data=df.to_csv(index=False),
+                file_name=f"attendance_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
     else:
         st.info("No records found.")
